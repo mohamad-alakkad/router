@@ -140,6 +140,25 @@ impl FairShareConfig {
     }
 }
 
+/// One fair-share flow, scoped to the model pool whose capacity it competes for.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct FairShareFlow {
+    pool: Arc<str>,
+    name: Box<str>,
+}
+
+impl FairShareFlow {
+    pub(crate) fn new(pool: &str, name: &str) -> Self {
+        Self {
+            pool: Arc::from(pool),
+            name: Box::from(name),
+        }
+    }
+}
+
+/// Shared handle stored on each Program decision.
+pub(crate) type FairShareFlowRef = Arc<FairShareFlow>;
+
 #[derive(Debug, Clone, Default)]
 struct FlowAccount {
     virtual_service: f64,
@@ -148,7 +167,7 @@ struct FlowAccount {
 
 #[derive(Debug, Clone)]
 struct PendingCharge {
-    flow: Arc<str>,
+    flow: FairShareFlowRef,
     prefill_estimate: f64,
     decode_estimate: f64,
     shared_prefix_tokens: usize,
@@ -173,9 +192,10 @@ pub(crate) struct FairShareSettlement {
 #[derive(Debug)]
 pub(crate) struct FairShareLedger {
     config: FairShareConfig,
-    flows: HashMap<Arc<str>, FlowAccount>,
-    /// Non-decreasing service floor of backlogged and in-flight flows.
-    floor: f64,
+    flows: HashMap<FairShareFlowRef, FlowAccount>,
+    /// Non-decreasing service floor per model pool, over flows that are
+    /// waiting or have unsettled work. Pools never share a floor.
+    floors: HashMap<Arc<str>, f64>,
     /// Provisional charges by dispatch order; settled at most once.
     pending: BTreeMap<u64, PendingCharge>,
     next_charge_id: u64,
@@ -192,7 +212,7 @@ impl FairShareLedger {
         Self {
             config,
             flows: HashMap::new(),
-            floor: 0.0,
+            floors: HashMap::new(),
             pending: BTreeMap::new(),
             next_charge_id: 0,
             evictions: 0,
@@ -200,14 +220,20 @@ impl FairShareLedger {
         }
     }
 
-    /// Model-pool-scoped flow key. Pools never share capacity or service.
-    pub(crate) fn flow_for(&self, identity: &ProgramIdentity) -> Arc<str> {
-        let name = self.config.flow_name(identity);
-        Arc::from(format!("{}\u{0}{}", identity.model_pool(), name))
+    /// Model-pool-scoped flow of one request.
+    pub(crate) fn flow_for(&self, identity: &ProgramIdentity) -> FairShareFlowRef {
+        Arc::new(FairShareFlow::new(
+            identity.model_pool(),
+            self.config.flow_name(identity),
+        ))
     }
 
-    /// A request arrived for `flow`: raise idle credit to the floor.
-    pub(crate) fn observe_arrival(&mut self, flow: &Arc<str>) {
+    fn floor(&self, flow: &FairShareFlow) -> f64 {
+        self.floors.get(&flow.pool).copied().unwrap_or(0.0)
+    }
+
+    /// A request arrived for `flow`: raise idle credit to its pool's floor.
+    pub(crate) fn observe_arrival(&mut self, flow: &FairShareFlowRef) {
         if !self.flows.contains_key(flow) && self.flows.len() >= self.config.max_tracked_flows {
             // Free an eighth of the cap at once so eviction cost is amortized.
             let headroom = (self.config.max_tracked_flows / 8).max(1);
@@ -216,7 +242,7 @@ impl FairShareLedger {
                 self.evict_to(self.config.max_tracked_flows.saturating_sub(headroom));
             }
         }
-        let floor = self.floor;
+        let floor = self.floor(flow);
         let account = self.flows.entry(flow.clone()).or_insert(FlowAccount {
             virtual_service: floor,
             in_flight_charges: 0,
@@ -226,46 +252,51 @@ impl FairShareLedger {
         }
     }
 
-    /// Current charged service, or the floor for an untracked flow.
-    pub(crate) fn virtual_service(&self, flow: &str) -> f64 {
+    /// Current charged service, or the pool floor for an untracked flow.
+    pub(crate) fn virtual_service(&self, flow: &FairShareFlow) -> f64 {
         self.flows
             .get(flow)
-            .map_or(self.floor, |account| account.virtual_service)
+            .map_or_else(|| self.floor(flow), |account| account.virtual_service)
     }
 
-    /// Total order of two flows; `Equal` defers to the ordinary order.
-    ///
-    /// A candidate without a flow ranks as an untracked flow on the floor, so
-    /// the comparison stays a total preorder for `sort_by`.
-    pub(crate) fn compare(&self, left: Option<&Arc<str>>, right: Option<&Arc<str>>) -> Ordering {
+    /// Service lead of `flow` over its pool floor, in charged tokens.
+    /// A refund can leave a flow below the floor; that lead is negative.
+    fn lead(&self, flow: &FairShareFlow) -> f64 {
+        self.virtual_service(flow) - self.floor(flow)
+    }
+
+    /// Ordering key: each candidate maps to one scalar, so comparisons form a
+    /// total preorder for `sort_by`. A candidate without a flow sits on a floor.
+    fn key(&self, flow: Option<&FairShareFlowRef>) -> f64 {
+        let lead = flow.map_or(0.0, |flow| self.lead(flow));
+        if self.config.band_tokens > 0.0 {
+            (lead.max(0.0) / self.config.band_tokens).floor()
+        } else {
+            lead
+        }
+    }
+
+    /// Compare two candidates' flows; `Equal` defers to the ordinary order.
+    pub(crate) fn compare(
+        &self,
+        left: Option<&FairShareFlowRef>,
+        right: Option<&FairShareFlowRef>,
+    ) -> Ordering {
         if let (Some(left), Some(right)) = (left, right) {
             if Arc::ptr_eq(left, right) || left == right {
                 return Ordering::Equal;
             }
         }
-        let service =
-            |flow: Option<&Arc<str>>| flow.map_or(self.floor, |flow| self.virtual_service(flow));
-        let left = service(left);
-        let right = service(right);
-        if self.config.band_tokens > 0.0 {
-            self.band(left).cmp(&self.band(right))
-        } else {
-            left.total_cmp(&right)
-        }
+        self.key(left).total_cmp(&self.key(right))
     }
 
-    fn band(&self, service: f64) -> u64 {
-        // Saturating float-to-int casts keep the order total for every input.
-        ((service - self.floor).max(0.0) / self.config.band_tokens).floor() as u64
-    }
-
-    /// Service lead of `flow` over the floor, in charged tokens.
-    pub(crate) fn lag(&self, flow: &str) -> f64 {
-        (self.virtual_service(flow) - self.floor).max(0.0)
+    /// Non-negative service lead of `flow`, for metrics.
+    pub(crate) fn lag(&self, flow: &FairShareFlow) -> f64 {
+        self.lead(flow).max(0.0)
     }
 
     /// Charge the estimated work of a dispatched request.
-    pub(crate) fn charge(&mut self, flow: &Arc<str>, estimate: FairShareEstimate) -> u64 {
+    pub(crate) fn charge(&mut self, flow: &FairShareFlowRef, estimate: FairShareEstimate) -> u64 {
         let uncached = estimate
             .context_tokens
             .saturating_sub(estimate.shared_prefix_tokens) as f64;
@@ -328,7 +359,7 @@ impl FairShareLedger {
             None => pending.decode_estimate,
         };
         let actual = self.cap(prefill_actual + decode_actual);
-        let floor = self.floor;
+        let floor = self.floor(&pending.flow);
         let account = self.flows.entry(pending.flow).or_insert(FlowAccount {
             virtual_service: floor + estimated,
             in_flight_charges: 1,
@@ -341,29 +372,47 @@ impl FairShareLedger {
         })
     }
 
-    /// Raise the floor to the least service among flows that have backlog or
-    /// unsettled work. `backlogged` lists the flows of eligible waiters.
-    pub(crate) fn advance_floor<'a>(&mut self, backlogged: impl IntoIterator<Item = &'a Arc<str>>) {
-        let waiting = backlogged
-            .into_iter()
-            .map(|flow| self.virtual_service(flow));
-        let in_flight = self
-            .flows
-            .values()
-            .filter(|account| account.in_flight_charges > 0)
-            .map(|account| account.virtual_service);
-        if let Some(minimum) = waiting.chain(in_flight).min_by(f64::total_cmp) {
-            if minimum > self.floor {
-                self.floor = minimum;
+    /// Raise each pool's floor to the least service among its flows that have
+    /// backlog or unsettled work. `backlogged` lists the flows of eligible
+    /// waiters.
+    pub(crate) fn advance_floor<'a>(
+        &mut self,
+        backlogged: impl IntoIterator<Item = &'a FairShareFlowRef>,
+    ) {
+        let mut minimum = HashMap::<Arc<str>, f64>::new();
+        let mut observe = |pool: &Arc<str>, service: f64| {
+            minimum
+                .entry(pool.clone())
+                .and_modify(|current| *current = current.min(service))
+                .or_insert(service);
+        };
+        for flow in backlogged {
+            observe(&flow.pool, self.virtual_service(flow));
+        }
+        for (flow, account) in &self.flows {
+            if account.in_flight_charges > 0 {
+                observe(&flow.pool, account.virtual_service);
+            }
+        }
+        for (pool, minimum) in minimum {
+            let floor = self.floors.entry(pool).or_insert(0.0);
+            if minimum > *floor {
+                *floor = minimum;
             }
         }
     }
 
-    /// Drop accounts that the floor would reset anyway. Lossless.
+    /// Drop accounts that their pool floor would reset anyway. Lossless.
     pub(crate) fn prune(&mut self) {
-        let floor = self.floor;
-        self.flows
-            .retain(|_, account| account.in_flight_charges > 0 || account.virtual_service > floor);
+        let floors = &self.floors;
+        self.flows.retain(|flow, account| {
+            account.in_flight_charges > 0
+                || account.virtual_service > floors.get(&flow.pool).copied().unwrap_or(0.0)
+        });
+        // A pool with no accounts restarts every returning flow equally.
+        let flows = &self.flows;
+        self.floors
+            .retain(|pool, _| flows.keys().any(|flow| &flow.pool == pool));
         self.evict_to(self.config.max_tracked_flows);
     }
 
@@ -376,7 +425,7 @@ impl FairShareLedger {
             .flows
             .iter()
             .filter(|(_, account)| account.in_flight_charges == 0)
-            .map(|(flow, account)| (account.virtual_service, flow.clone()))
+            .map(|(flow, _)| (self.lead(flow), flow.clone()))
             .collect::<Vec<_>>();
         idle.sort_by(|left, right| {
             left.0
@@ -406,15 +455,15 @@ impl FairShareLedger {
     pub(crate) fn snapshot(&self) -> FairShareDiagnostic {
         let max_lag_tokens = self
             .flows
-            .values()
-            .map(|account| (account.virtual_service - self.floor).max(0.0))
+            .keys()
+            .map(|flow| self.lag(flow))
             .fold(0.0, f64::max);
         FairShareDiagnostic {
             flow_key: self.config.flow_key,
             band_tokens: self.config.band_tokens,
             tracked_flows: self.flows.len(),
+            tracked_pools: self.floors.len(),
             pending_charges: self.pending.len(),
-            floor_tokens: self.floor,
             max_lag_tokens,
             evictions_total: self.evictions,
             abandoned_charges_total: self.abandoned_charges,
@@ -430,6 +479,11 @@ impl FairShareLedger {
     pub(crate) fn pending_charges(&self) -> usize {
         self.pending.len()
     }
+
+    #[cfg(all(test, feature = "cpu", feature = "ready"))]
+    pub(crate) fn pool_floor(&self, pool: &str) -> f64 {
+        self.floors.get(pool).copied().unwrap_or(0.0)
+    }
 }
 
 /// Aggregate fair-share state. Flow identifiers are never exposed.
@@ -438,8 +492,8 @@ pub struct FairShareDiagnostic {
     pub flow_key: FairShareFlowKey,
     pub band_tokens: f64,
     pub tracked_flows: usize,
+    pub tracked_pools: usize,
     pub pending_charges: usize,
-    pub floor_tokens: f64,
     pub max_lag_tokens: f64,
     pub evictions_total: u64,
     pub abandoned_charges_total: u64,
@@ -449,8 +503,8 @@ pub struct FairShareDiagnostic {
 mod tests {
     use super::*;
 
-    fn flow(name: &str) -> Arc<str> {
-        Arc::from(name)
+    fn flow(name: &str) -> FairShareFlowRef {
+        Arc::new(FairShareFlow::new("model", name))
     }
 
     fn estimate(context: usize, output: usize) -> FairShareEstimate {
@@ -662,6 +716,25 @@ mod tests {
     }
 
     #[test]
+    fn model_pools_keep_independent_floors() {
+        let mut ledger = FairShareLedger::new(FairShareConfig::default());
+        let busy = Arc::new(FairShareFlow::new("busy-pool", "a"));
+        let quiet = Arc::new(FairShareFlow::new("quiet-pool", "a"));
+        let id = ledger.charge(&busy, estimate(100_000, 0));
+        ledger.settle(id, &usage(100_000, 0, 0), true).unwrap();
+        ledger.charge(&quiet, estimate(10, 0));
+        ledger.advance_floor([&busy]);
+        assert_eq!(ledger.pool_floor("busy-pool"), 100_000.0);
+        assert_eq!(ledger.pool_floor("quiet-pool"), 10.0);
+        // A new busy-pool flow starts level with its own pool, not the quiet one.
+        let newcomer = Arc::new(FairShareFlow::new("busy-pool", "b"));
+        ledger.observe_arrival(&newcomer);
+        assert_eq!(ledger.virtual_service(&newcomer), 100_000.0);
+        // Equal names in different pools are distinct flows.
+        assert_ne!(busy, quiet);
+    }
+
+    #[test]
     fn floor_never_decreases_and_tracks_in_flight_work() {
         let mut ledger = FairShareLedger::new(FairShareConfig::default());
         let a = flow("a");
@@ -669,10 +742,10 @@ mod tests {
         ledger.charge(&a, estimate(100, 0));
         let id = ledger.charge(&b, estimate(300, 0));
         ledger.advance_floor(std::iter::empty());
-        assert_eq!(ledger.snapshot().floor_tokens, 100.0);
+        assert_eq!(ledger.pool_floor("model"), 100.0);
         ledger.settle(id, &usage(0, 0, 0), true).unwrap();
         ledger.advance_floor(std::iter::empty());
-        assert_eq!(ledger.snapshot().floor_tokens, 100.0);
+        assert_eq!(ledger.pool_floor("model"), 100.0);
     }
 
     #[test]

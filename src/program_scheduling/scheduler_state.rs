@@ -272,7 +272,7 @@ pub(crate) struct ProgramDecisionState {
     pub(crate) last_return_actual_seconds: Option<f64>,
     pub(crate) last_output_actual_tokens: Option<usize>,
     /// Fair-share flow; `None` when fair share is disabled.
-    pub(crate) fair_share_flow: Option<Arc<str>>,
+    pub(crate) fair_share_flow: Option<super::fair_share::FairShareFlowRef>,
 }
 
 impl ProgramDecisionState {

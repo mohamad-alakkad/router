@@ -227,10 +227,11 @@ freed.
 - A PD transport restart keeps the original charge.
 - A request cancelled while still waiting in the RequestPool is never charged.
 
-**Floor.** The ledger keeps a non-decreasing floor: the least charged service
-among flows that are waiting or have unsettled work. A flow that arrives below
-the floor is raised to it, so idle time cannot be saved up into a later burst.
-An idle account at the floor carries no information and is pruned on the
+**Floor.** For each model pool, the ledger keeps a non-decreasing floor: the
+least charged service among that pool's flows that are waiting or have
+unsettled work. A flow that arrives below the floor is raised to it, so idle
+time cannot be saved up into a later burst. An idle account at the floor
+carries no information and is pruned on the
 periodic tick.
 
 **Recommended pairing.** Use `resume_order: fcfs` with fair share. Agents of the
@@ -251,7 +252,7 @@ because its KV-locality benefit is not captured by that simulation.
 - `/scheduling/diagnostics` gains a `fair_share` object when the feature is enabled:
   - `tracked_flows`
   - `pending_charges`
-  - `floor_tokens`
+  - `tracked_pools`
   - `max_lag_tokens`
   - `evictions_total`
   - `abandoned_charges_total`

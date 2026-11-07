@@ -740,7 +740,7 @@ fn ordering_overhead() {
                     ledger.charge(
                         &flow,
                         super::fair_share::FairShareEstimate {
-                            context_tokens: (flow.len() * 7919) % 50_000,
+                            context_tokens: (refs.len() * 7_919) % 50_000,
                             shared_prefix_tokens: 0,
                             output_tokens: 0,
                         },

@@ -3,7 +3,7 @@
 //! Every hook is a no-op when `fair_share.enabled` is false, so the default
 //! scheduler commits exactly the decisions it committed before this feature.
 
-use super::fair_share::FairShareEstimate;
+use super::fair_share::{FairShareEstimate, FairShareFlowRef};
 use super::scheduler::ProgramScheduler;
 use super::scheduler_state::ProgramSchedulerState;
 use super::{
@@ -12,7 +12,6 @@ use super::{
 };
 use crate::metrics::RouterMetrics;
 use std::cmp::Ordering;
-use std::sync::Arc;
 
 impl ProgramScheduler {
     /// Bind the request's flow to its Program and apply the arrival floor.
@@ -107,7 +106,7 @@ impl ProgramScheduler {
                 })
             })
             .filter_map(|program| state.decisions.get(program)?.fair_share_flow.clone())
-            .collect::<Vec<Arc<str>>>();
+            .collect::<Vec<FairShareFlowRef>>();
         if let Some(ledger) = state.fair_share.as_mut() {
             ledger.advance_floor(backlogged.iter());
         }
@@ -147,6 +146,7 @@ mod tests {
         FairShareConfig, ProgramResumeOrder, ProgramSchedulerConfig, ProgramTarget,
     };
     use serde_json::json;
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     fn target() -> ProgramTarget {
@@ -331,7 +331,7 @@ mod tests {
     #[tokio::test]
     async fn retried_attempt_without_output_is_refunded_but_aborted_stream_is_not() {
         let scheduler = single_slot(true, ProgramResumeOrder::Fcfs);
-        let flow = Arc::<str>::from("model\u{0}task");
+        let flow = super::super::fair_share::FairShareFlow::new("model", "task");
         let service = |scheduler: &ProgramScheduler| {
             scheduler
                 .state
@@ -398,7 +398,7 @@ mod tests {
         let ledger = state.fair_share.as_ref().unwrap();
         // Only the blocker's dispatch is outstanding.
         assert_eq!(ledger.pending_charges(), 1);
-        let light = Arc::<str>::from("model\u{0}light");
+        let light = super::super::fair_share::FairShareFlow::new("model", "light");
         assert_eq!(ledger.lag(&light), 0.0);
         drop(state);
         scheduler.complete(&blocker, true, true, usage(100, 1), None);
