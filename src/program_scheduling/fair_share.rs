@@ -55,7 +55,7 @@ pub struct FairShareConfig {
     #[serde(default = "default_max_charge_tokens")]
     pub max_charge_tokens: f64,
     /// Service difference treated as equal; ties use the ordinary order.
-    #[serde(default)]
+    #[serde(default = "default_band_tokens")]
     pub band_tokens: f64,
     /// Upper bound of retained idle flow accounts.
     #[serde(default = "default_max_tracked_flows")]
@@ -74,6 +74,10 @@ fn default_max_charge_tokens() -> f64 {
     262_144.0
 }
 
+fn default_band_tokens() -> f64 {
+    8_192.0
+}
+
 fn default_max_tracked_flows() -> usize {
     4096
 }
@@ -86,7 +90,7 @@ impl Default for FairShareConfig {
             prefill_token_weight: default_prefill_token_weight(),
             decode_token_weight: default_decode_token_weight(),
             max_charge_tokens: default_max_charge_tokens(),
-            band_tokens: 0.0,
+            band_tokens: default_band_tokens(),
             max_tracked_flows: default_max_tracked_flows(),
         }
     }
@@ -205,8 +209,12 @@ impl FairShareLedger {
     /// A request arrived for `flow`: raise idle credit to the floor.
     pub(crate) fn observe_arrival(&mut self, flow: &Arc<str>) {
         if !self.flows.contains_key(flow) && self.flows.len() >= self.config.max_tracked_flows {
+            // Free an eighth of the cap at once so eviction cost is amortized.
+            let headroom = (self.config.max_tracked_flows / 8).max(1);
             self.prune();
-            self.evict_to(self.config.max_tracked_flows.saturating_sub(1));
+            if self.flows.len() >= self.config.max_tracked_flows {
+                self.evict_to(self.config.max_tracked_flows.saturating_sub(headroom));
+            }
         }
         let floor = self.floor;
         let account = self.flows.entry(flow.clone()).or_insert(FlowAccount {
@@ -226,15 +234,19 @@ impl FairShareLedger {
     }
 
     /// Total order of two flows; `Equal` defers to the ordinary order.
+    ///
+    /// A candidate without a flow ranks as an untracked flow on the floor, so
+    /// the comparison stays a total preorder for `sort_by`.
     pub(crate) fn compare(&self, left: Option<&Arc<str>>, right: Option<&Arc<str>>) -> Ordering {
-        let (Some(left), Some(right)) = (left, right) else {
-            return Ordering::Equal;
-        };
-        if Arc::ptr_eq(left, right) || left == right {
-            return Ordering::Equal;
+        if let (Some(left), Some(right)) = (left, right) {
+            if Arc::ptr_eq(left, right) || left == right {
+                return Ordering::Equal;
+            }
         }
-        let left = self.virtual_service(left);
-        let right = self.virtual_service(right);
+        let service =
+            |flow: Option<&Arc<str>>| flow.map_or(self.floor, |flow| self.virtual_service(flow));
+        let left = service(left);
+        let right = service(right);
         if self.config.band_tokens > 0.0 {
             self.band(left).cmp(&self.band(right))
         } else {
@@ -286,16 +298,21 @@ impl FairShareLedger {
 
     /// Replace one provisional charge with reported usage, exactly once.
     ///
-    /// Missing usage fields keep the corresponding estimate. A second call for
-    /// the same charge is a no-op.
+    /// Missing usage fields keep the corresponding estimate. An attempt that
+    /// produced no output is refunded: Router retries are fresh arrivals, so
+    /// this keeps a retried request charged once, and a client gains nothing
+    /// from work it never received. A second call for the same charge is a
+    /// no-op.
     pub(crate) fn settle(
         &mut self,
         id: u64,
         usage: &ProgramUsageObservation,
+        produced_output: bool,
     ) -> Option<FairShareSettlement> {
         let pending = self.pending.remove(&id)?;
         let estimated = self.cap(pending.prefill_estimate + pending.decode_estimate);
         let prefill_actual = match usage.prompt_tokens {
+            _ if !produced_output => 0.0,
             Some(prompt) => {
                 let cached = usage
                     .cached_prompt_tokens
@@ -305,11 +322,11 @@ impl FairShareLedger {
             }
             None => pending.prefill_estimate,
         };
-        let decode_actual = usage
-            .completion_tokens
-            .map_or(pending.decode_estimate, |tokens| {
-                tokens as f64 * self.config.decode_token_weight
-            });
+        let decode_actual = match usage.completion_tokens {
+            _ if !produced_output => 0.0,
+            Some(tokens) => tokens as f64 * self.config.decode_token_weight,
+            None => pending.decode_estimate,
+        };
         let actual = self.cap(prefill_actual + decode_actual);
         let floor = self.floor;
         let account = self.flows.entry(pending.flow).or_insert(FlowAccount {
@@ -496,7 +513,10 @@ mod tests {
 
     #[test]
     fn cheaper_flow_orders_first_and_equal_service_defers() {
-        let mut ledger = FairShareLedger::new(FairShareConfig::default());
+        let mut ledger = FairShareLedger::new(FairShareConfig {
+            band_tokens: 0.0,
+            ..Default::default()
+        });
         let heavy = flow("heavy");
         let light = flow("light");
         ledger.observe_arrival(&heavy);
@@ -506,7 +526,33 @@ mod tests {
         ledger.charge(&light, estimate(2_000, 128));
         assert_eq!(ledger.compare(Some(&light), Some(&heavy)), Ordering::Less);
         assert_eq!(ledger.compare(Some(&heavy), Some(&heavy)), Ordering::Equal);
-        assert_eq!(ledger.compare(None, Some(&heavy)), Ordering::Equal);
+        // A flow-less candidate sits on the floor: ahead of served flows.
+        assert_eq!(ledger.compare(None, Some(&heavy)), Ordering::Less);
+        assert_eq!(ledger.compare(None, None), Ordering::Equal);
+    }
+
+    #[test]
+    fn comparison_is_a_total_preorder_for_sorting() {
+        for band_tokens in [0.0, 1_000.0] {
+            let mut ledger = FairShareLedger::new(FairShareConfig {
+                band_tokens,
+                ..Default::default()
+            });
+            let flows = (0..64).map(|i| flow(&format!("f{i}"))).collect::<Vec<_>>();
+            for (i, f) in flows.iter().enumerate() {
+                ledger.charge(f, estimate((i * 7_919) % 5_000, 0));
+            }
+            ledger.advance_floor(flows.iter().take(8));
+            let mut candidates = flows
+                .iter()
+                .map(Some)
+                .chain(std::iter::repeat_n(None, 8))
+                .collect::<Vec<_>>();
+            candidates.sort_by(|left, right| ledger.compare(*left, *right));
+            for pair in candidates.windows(2) {
+                assert_ne!(ledger.compare(pair[0], pair[1]), Ordering::Greater);
+            }
+        }
     }
 
     #[test]
@@ -533,11 +579,11 @@ mod tests {
         let a = flow("a");
         let id = ledger.charge(&a, estimate(1_000, 100));
         assert_eq!(ledger.virtual_service(&a), 1_200.0);
-        let settled = ledger.settle(id, &usage(1_000, 600, 50)).unwrap();
+        let settled = ledger.settle(id, &usage(1_000, 600, 50), true).unwrap();
         assert_eq!(settled.estimated_tokens, 1_200.0);
         assert_eq!(settled.actual_tokens, 500.0);
         assert_eq!(ledger.virtual_service(&a), 500.0);
-        assert!(ledger.settle(id, &usage(9_999, 0, 9_999)).is_none());
+        assert!(ledger.settle(id, &usage(9_999, 0, 9_999), true).is_none());
         assert_eq!(ledger.virtual_service(&a), 500.0);
         assert_eq!(ledger.pending_charges(), 0);
     }
@@ -555,7 +601,7 @@ mod tests {
             },
         );
         ledger
-            .settle(id, &ProgramUsageObservation::default())
+            .settle(id, &ProgramUsageObservation::default(), true)
             .unwrap();
         assert_eq!(ledger.virtual_service(&a), 700.0);
         // A prompt without cache evidence assumes the estimated shared prefix,
@@ -569,9 +615,23 @@ mod tests {
             },
         );
         ledger
-            .settle(id, &ProgramUsageObservation::from(Some(1_000)))
+            .settle(id, &ProgramUsageObservation::from(Some(1_000)), true)
             .unwrap();
         assert_eq!(ledger.virtual_service(&a), 700.0 + 600.0 + 100.0);
+    }
+
+    #[test]
+    fn attempt_without_output_is_refunded() {
+        let mut ledger = FairShareLedger::new(FairShareConfig::default());
+        let a = flow("a");
+        let id = ledger.charge(&a, estimate(10_000, 100));
+        assert_eq!(ledger.virtual_service(&a), 10_100.0);
+        let settled = ledger
+            .settle(id, &ProgramUsageObservation::default(), false)
+            .unwrap();
+        assert_eq!(settled.actual_tokens, 0.0);
+        assert_eq!(ledger.virtual_service(&a), 0.0);
+        assert_eq!(ledger.pending_charges(), 0);
     }
 
     #[test]
@@ -583,7 +643,7 @@ mod tests {
         let a = flow("a");
         let id = ledger.charge(&a, estimate(1_000_000, 0));
         assert_eq!(ledger.virtual_service(&a), 10_000.0);
-        ledger.settle(id, &usage(5_000_000, 0, 0)).unwrap();
+        ledger.settle(id, &usage(5_000_000, 0, 0), true).unwrap();
         assert_eq!(ledger.virtual_service(&a), 10_000.0);
     }
 
@@ -593,7 +653,7 @@ mod tests {
         let busy = flow("busy");
         let idle = flow("idle");
         let id = ledger.charge(&busy, estimate(50_000, 0));
-        ledger.settle(id, &usage(50_000, 0, 0)).unwrap();
+        ledger.settle(id, &usage(50_000, 0, 0), true).unwrap();
         ledger.advance_floor([&busy]);
         assert_eq!(ledger.lag(&busy), 0.0);
         ledger.observe_arrival(&idle);
@@ -610,7 +670,7 @@ mod tests {
         let id = ledger.charge(&b, estimate(300, 0));
         ledger.advance_floor(std::iter::empty());
         assert_eq!(ledger.snapshot().floor_tokens, 100.0);
-        ledger.settle(id, &usage(0, 0, 0)).unwrap();
+        ledger.settle(id, &usage(0, 0, 0), true).unwrap();
         ledger.advance_floor(std::iter::empty());
         assert_eq!(ledger.snapshot().floor_tokens, 100.0);
     }
@@ -626,7 +686,7 @@ mod tests {
         let c = flow("c");
         for (f, tokens) in [(&a, 10), (&b, 20)] {
             let id = ledger.charge(f, estimate(tokens, 0));
-            ledger.settle(id, &usage(tokens, 0, 0)).unwrap();
+            ledger.settle(id, &usage(tokens, 0, 0), true).unwrap();
         }
         ledger.advance_floor([&a]);
         ledger.prune();
@@ -647,7 +707,7 @@ mod tests {
         });
         for (f, tokens) in [(&a, 10), (&b, 20)] {
             let id = ledger.charge(f, estimate(tokens, 0));
-            ledger.settle(id, &usage(tokens, 0, 0)).unwrap();
+            ledger.settle(id, &usage(tokens, 0, 0), true).unwrap();
         }
         ledger.observe_arrival(&c);
         assert_eq!(ledger.tracked_flows(), 2);
@@ -667,7 +727,7 @@ mod tests {
         let id = ledger.charge(&a, estimate(10, 0));
         ledger.charge(&b, estimate(10, 0));
         assert_eq!(ledger.tracked_flows(), 2);
-        assert!(ledger.settle(id, &usage(10, 0, 0)).is_some());
+        assert!(ledger.settle(id, &usage(10, 0, 0), true).is_some());
         assert_eq!(ledger.virtual_service(&a), 10.0);
     }
 }

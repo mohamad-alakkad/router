@@ -116,6 +116,7 @@ All fields below belong to `program_scheduling`. Values omitted from the JSON ob
 | `decode_throughput_model.fixed_step_seconds` | `0.010635218423115973` | Sets the batch-independent decode-step latency in the throughput surface used to estimate admission batch gain. |
 | `decode_throughput_model.batch_step_seconds_per_request` | `0.0004192803698834784` | Sets the additional decode-step latency contributed by each request in the batch. |
 | `decode_throughput_model.context_step_seconds_per_token` | `1.420458414996201e-7` | Sets the additional decode-step latency contributed by each token in the sum of full Program contexts. |
+| `fair_share` | disabled | Opt-in token-cost fair-share ordering of ordinary resume candidates. See [Token-cost fair share](#token-cost-fair-share). |
 
 ## Canonical request metadata
 
@@ -163,6 +164,114 @@ Resume first selects expired force-resume deadlines, then larger request priorit
 The first implementation contains no automatic privileged Program, relationship handoff, privileged TTL, or privileged capacity demotion. Programs that consume a complete continuous segment yield once to other waiters, while force resume bounds starvation.
 
 Acting Programs are not reclaimed by admission or resume. Their TTL and terminal lifecycle are responsible for moving them out of ACTIVE state; capacity repair pauses reasoning Programs under pressure.
+
+## Token-cost fair share
+
+Ordinary resume order (MRU or FCFS) does not consider how much work a flow has
+already consumed. Under contention, a flow whose turns carry long uncached
+prompts and long generations receives the same resume preference as a flow of
+short turns. The optional `fair_share` block adds one ordering tier. Among
+waiters that are already eligible, the flow that has been charged the least
+token work resumes first.
+
+```json
+{
+  "resume_order": "fcfs",
+  "fair_share": {
+    "enabled": true,
+    "flow_key": "task_id",
+    "prefill_token_weight": 1.0,
+    "decode_token_weight": 1.0,
+    "max_charge_tokens": 262144,
+    "band_tokens": 8192,
+    "max_tracked_flows": 4096
+  }
+}
+```
+
+| Field | Default | Effect |
+|---|---:|---|
+| `enabled` | `false` | Allocates the ledger and enables the ordering tier. When disabled, no state is kept and decisions are unchanged. |
+| `flow_key` | `task_id` | Groups Programs into flows. `task_id` falls back to `root_program_id`, then to `program_id`. `root_program_id` falls back to `program_id`. `program_id` makes every Program its own flow. Flows are scoped to their model pool. |
+| `prefill_token_weight` | `1.0` | Charge per uncached prompt token. |
+| `decode_token_weight` | `1.0` | Charge per generated token. |
+| `max_charge_tokens` | `262144` | Caps any single estimated or settled charge, which bounds the effect of a bad estimate. |
+| `band_tokens` | `8192` | Service differences within one band count as ties and use `resume_order`. `0` orders strictly by charged service. |
+| `max_tracked_flows` | `4096` | Caps retained idle flow accounts. Accounts with unsettled work are never evicted. |
+
+**Where the tier applies.** The tier sits after force-resume deadlines, request
+`priority`, and the one-shot segment-yield penalty, and before `resume_order`.
+It changes only which eligible waiter is tried first. It never grants capacity
+and never bypasses the token, waiting-request, or Program-count gates. Because
+force resume still outranks it, the existing starvation bound
+(`force_resume_timeout_seconds`, then `queue_timeout_seconds`) is unchanged.
+Cross-rank resume in `global_queue` mode stays FCFS. Programs that already hold
+capacity are not preempted. Fair share decides who receives capacity when it is
+freed.
+
+**Charging.**
+- When a request is dispatched, its flow is charged
+  `prefill_token_weight * (estimated_context - shared_prefix) + decode_token_weight * output`.
+  The output part is `expected_output_length`, or `decode_buffer_tokens` when that is absent.
+- When the request completes, the charge is replaced once by the reported
+  `prompt_tokens - cached_prompt_tokens` and `completion_tokens`. Any missing
+  field keeps its estimate.
+- Settlement uses the same exactly-once completion path as Program accounting,
+  so a charge is settled at most once across streaming, errors, and client
+  disconnects.
+- An attempt that fails without returning output or usage is refunded. Each
+  Router retry is a fresh Program arrival, so a retried request is still charged
+  once.
+- An attempt that streamed any output keeps its charge even if the client
+  disconnects, so aborting a stream cannot avoid accounting.
+- A PD transport restart keeps the original charge.
+- A request cancelled while still waiting in the RequestPool is never charged.
+
+**Floor.** The ledger keeps a non-decreasing floor: the least charged service
+among flows that are waiting or have unsettled work. A flow that arrives below
+the floor is raised to it, so idle time cannot be saved up into a later burst.
+An idle account at the floor carries no information and is pruned on the
+periodic tick.
+
+**Recommended pairing.** Use `resume_order: fcfs` with fair share. Agents of the
+same flow tie on service. With an MRU tie-break, the most recently finished
+agent keeps winning those ties, and in the CPU simulation below this pushed
+other agents of the flow to the force-resume deadline. MRU remains available
+because its KV-locality benefit is not captured by that simulation.
+
+**Limits.**
+- `task_id`, `root_program_id`, and `program_id` are request-body metadata. A
+  client can split its work across identifiers. Fair share therefore balances
+  cooperating workflows. It does not isolate tenants, and it is not a quota.
+- Token units are not GPU time. Prefill cost grows faster than linearly with
+  prompt length, so equal token shares can still mean unequal GPU time.
+  Weights are configuration and are not calibrated automatically.
+
+**Observability.**
+- `/scheduling/diagnostics` gains a `fair_share` object when the feature is enabled:
+  - `tracked_flows`
+  - `pending_charges`
+  - `floor_tokens`
+  - `max_lag_tokens`
+  - `evictions_total`
+  - `abandoned_charges_total`
+- New Prometheus metrics. Only target IDs and a bounded `phase` enum appear as
+  labels, never flow identifiers.
+  - `vllm_router_agent_aware_fair_share_charged_tokens_total{target,phase}`
+  - `vllm_router_agent_aware_fair_share_estimate_error_ratio{target}`
+  - `vllm_router_agent_aware_fair_share_resume_lag_tokens{target}`
+  - `vllm_router_agent_aware_fair_share_tracked_flows`
+
+**Reproducible CPU simulation.** `src/program_scheduling/fair_share_sim.rs` replays
+seeded closed-loop traces through the real RequestPool, comparator, and ledger,
+in virtual time. Capacity is modeled as a Program-count slot limit, and
+service times come from the reference calibration surfaces. It does not model
+KV reuse, token-capacity admission, or Progress-TTL retention. Run the arm
+comparison and the comparator-overhead table with:
+
+```bash
+cargo test --release --features cpu,ready --lib fair_share_sim -- --ignored --nocapture
+```
 
 ## Offline calibration models
 

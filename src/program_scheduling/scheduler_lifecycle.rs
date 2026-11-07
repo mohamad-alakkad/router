@@ -76,7 +76,10 @@ impl ProgramScheduler {
     ) {
         let now = Instant::now();
         let mut state = self.state.lock();
-        self.fair_share_settle(&mut state, dispatch, &usage);
+        // Success, any usage, or streamed output means the backend served work.
+        let produced_output =
+            success || usage != ProgramUsageObservation::default() || decode_seconds.is_some();
+        self.fair_share_settle(&mut state, dispatch, &usage, produced_output);
         let Some(runtime_before) = state.runtime.view(dispatch.program()) else {
             return;
         };

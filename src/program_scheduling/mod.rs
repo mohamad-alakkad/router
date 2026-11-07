@@ -9,6 +9,8 @@ mod diagnostics;
 mod domain;
 mod factors;
 mod fair_share;
+#[cfg(all(test, feature = "cpu", feature = "ready"))]
+mod fair_share_sim;
 mod identity;
 mod lineage;
 mod observations;

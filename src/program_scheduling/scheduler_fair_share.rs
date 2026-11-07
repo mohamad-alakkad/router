@@ -73,13 +73,14 @@ impl ProgramScheduler {
         state: &mut ProgramSchedulerState,
         dispatch: &ProgramDispatch,
         usage: &ProgramUsageObservation,
+        produced_output: bool,
     ) {
         let (Some(ledger), Some(charge)) =
             (state.fair_share.as_mut(), dispatch.fair_share_charge())
         else {
             return;
         };
-        if let Some(settlement) = ledger.settle(charge, usage) {
+        if let Some(settlement) = ledger.settle(charge, usage, produced_output) {
             RouterMetrics::record_agent_aware_fair_share_settlement(
                 &dispatch.target_id,
                 settlement.estimated_tokens,
@@ -325,6 +326,53 @@ mod tests {
         let ledger = state.fair_share.as_ref().unwrap();
         assert_eq!(ledger.virtual_service(&flow), 1_040.0);
         assert_eq!(ledger.pending_charges(), 0);
+    }
+
+    #[tokio::test]
+    async fn retried_attempt_without_output_is_refunded_but_aborted_stream_is_not() {
+        let scheduler = single_slot(true, ProgramResumeOrder::Fcfs);
+        let flow = Arc::<str>::from("model\u{0}task");
+        let service = |scheduler: &ProgramScheduler| {
+            scheduler
+                .state
+                .lock()
+                .fair_share
+                .as_ref()
+                .unwrap()
+                .virtual_service(&flow)
+        };
+        // A pre-output backend failure, then the Router's retry as a fresh arrival.
+        let failed = scheduler
+            .acquire(identity("p", "task"), 1_000, &[target()], None)
+            .await
+            .unwrap();
+        scheduler.complete(
+            &failed,
+            false,
+            false,
+            ProgramUsageObservation::default(),
+            None,
+        );
+        let retry = scheduler
+            .acquire(identity("p", "task"), 1_000, &[target()], None)
+            .await
+            .unwrap();
+        scheduler.complete(&retry, true, false, usage(1_000, 50), None);
+        assert_eq!(service(&scheduler), 1_050.0);
+
+        // A client that disconnects after streamed output keeps its estimate.
+        let aborted = scheduler
+            .acquire(identity("p", "task"), 1_000, &[target()], None)
+            .await
+            .unwrap();
+        scheduler.complete(
+            &aborted,
+            false,
+            false,
+            ProgramUsageObservation::default(),
+            Some(0.5),
+        );
+        assert_eq!(service(&scheduler), 1_050.0 + 1_100.0);
     }
 
     #[tokio::test]
