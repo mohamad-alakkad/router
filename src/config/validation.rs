@@ -190,6 +190,10 @@ impl ConfigValidator {
                     .to_string(),
             });
         }
+        config
+            .fair_share
+            .validate()
+            .map_err(|reason| ConfigError::ValidationFailed { reason })?;
         let prediction = &config.prediction_profile;
         if !prediction.snapshot_interval_seconds.is_finite()
             || prediction.snapshot_interval_seconds <= 0.0

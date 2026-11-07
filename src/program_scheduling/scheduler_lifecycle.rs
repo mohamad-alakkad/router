@@ -76,6 +76,7 @@ impl ProgramScheduler {
     ) {
         let now = Instant::now();
         let mut state = self.state.lock();
+        self.fair_share_settle(&mut state, dispatch, &usage);
         let Some(runtime_before) = state.runtime.view(dispatch.program()) else {
             return;
         };
@@ -525,6 +526,7 @@ impl ProgramScheduler {
             self.repair_capacity(state, now);
             self.schedule_waiting(state, now);
         }
+        self.prune_fair_share(state);
     }
 
     fn expire_acting_ttls(&self, state: &mut ProgramSchedulerState, now: Instant) -> bool {

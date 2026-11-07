@@ -673,6 +673,7 @@ impl ProgramScheduler {
             decision.step_id = identity
                 .step_id()
                 .unwrap_or_else(|| decision.step_id.saturating_add(1));
+            self.fair_share_observe_arrival(state, identity, &reference);
             return;
         }
         let candidates = self.binding_candidates(state, identity, now);
@@ -696,7 +697,8 @@ impl ProgramScheduler {
         decision.profile_version = identity.profile_version().map(str::to_string);
         decision.output_token_reservation = identity.request_hints().expected_output_tokens;
         decision.step_id = identity.step_id().unwrap_or(0);
-        state.decisions.insert(reference, decision);
+        state.decisions.insert(reference.clone(), decision);
+        self.fair_share_observe_arrival(state, identity, &reference);
     }
 
     pub(crate) fn observation_is_fresh(

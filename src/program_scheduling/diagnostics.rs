@@ -148,6 +148,9 @@ pub struct ProgramSchedulerDiagnostic {
     pub return_time_profile_keys: usize,
     pub output_length_profile_keys: usize,
     pub ranks: Vec<RankDiagnostic>,
+    /// Present only when token-cost fair share is enabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fair_share: Option<super::FairShareDiagnostic>,
 }
 
 impl ProgramScheduler {
@@ -548,6 +551,7 @@ impl ProgramScheduler {
             return_time_profile_keys: state.prediction_profiles.return_key_count(),
             output_length_profile_keys: state.prediction_profiles.output_key_count(),
             ranks,
+            fair_share: state.fair_share.as_ref().map(|ledger| ledger.snapshot()),
         }
     }
 }

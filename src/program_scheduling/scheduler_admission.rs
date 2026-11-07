@@ -421,7 +421,8 @@ impl ProgramScheduler {
                 return None;
             }
         }
-        let dispatch = state.runtime.admit_front(handle, target, Instant::now())?;
+        let mut dispatch = state.runtime.admit_front(handle, target, Instant::now())?;
+        self.fair_share_charge_dispatch(&mut state, &mut dispatch);
         // Promote the admitted turn's context estimate: the front request is
         // now the Program's active turn, and later admission must account for
         // its real prompt rather than the previous front's smaller one.
@@ -587,6 +588,7 @@ impl ProgramScheduler {
     }
 
     pub(crate) fn schedule_waiting(&self, state: &mut ProgramSchedulerState, now: Instant) -> bool {
+        self.refresh_fair_share_floor(state);
         if self.config.global_queue {
             self.schedule_global_waiting(state, now)
         } else {
@@ -684,6 +686,10 @@ impl ProgramScheduler {
         left: &ProgramRef,
         right: &ProgramRef,
     ) -> Ordering {
+        let fair_share = self.fair_share_cmp(state, left, right);
+        if fair_share != Ordering::Equal {
+            return fair_share;
+        }
         let left_state = &state.decisions[left];
         let right_state = &state.decisions[right];
         match self.config.resume_order {

@@ -4,8 +4,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 
 use crate::program_scheduling::{
-    DecodeThroughputModel, PrefillCostModel, ProgramBindingStrategy, ProgramResumeOrder,
-    ProgramSchedulingEnableKey,
+    DecodeThroughputModel, FairShareConfig, PrefillCostModel, ProgramBindingStrategy,
+    ProgramResumeOrder, ProgramSchedulingEnableKey,
 };
 
 /// Main router configuration
@@ -430,6 +430,9 @@ pub struct ProgramSchedulingConfig {
     /// Offline-seeded, online-updated workflow prediction in off/shadow mode.
     #[serde(default)]
     pub prediction_profile: PredictionProfileConfig,
+    /// Opt-in token-cost fair-share ordering of retained Program requests.
+    #[serde(default, skip_serializing_if = "FairShareConfig::is_default")]
+    pub fair_share: FairShareConfig,
     /// Offline-calibrated cold-prefill cost and mixed-batch decode impact.
     #[serde(default)]
     pub prefill_cost_model: PrefillCostModel,
@@ -549,6 +552,7 @@ impl Default for ProgramSchedulingConfig {
             stats_window_size: default_program_stats_window_size(),
             enable_batch_gain_admission: default_program_enable_batch_gain_admission(),
             prediction_profile: PredictionProfileConfig::default(),
+            fair_share: FairShareConfig::default(),
             prefill_cost_model: PrefillCostModel::default(),
             decode_throughput_model: DecodeThroughputModel::default(),
             explicit_calibration_fields: ExplicitCalibrationFields::default(),
@@ -612,6 +616,8 @@ struct ProgramSchedulingConfigInput {
     enable_batch_gain_admission: bool,
     #[serde(default)]
     prediction_profile: PredictionProfileConfig,
+    #[serde(default)]
+    fair_share: FairShareConfig,
     #[serde(default)]
     prefill_cost_model: PrefillCostModelInput,
     #[serde(default)]
@@ -723,6 +729,7 @@ impl<'de> Deserialize<'de> for ProgramSchedulingConfig {
             stats_window_size: input.stats_window_size,
             enable_batch_gain_admission: input.enable_batch_gain_admission,
             prediction_profile: input.prediction_profile,
+            fair_share: input.fair_share,
             prefill_cost_model,
             decode_throughput_model,
             explicit_calibration_fields: ExplicitCalibrationFields(explicit_calibration_fields),

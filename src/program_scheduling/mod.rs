@@ -8,6 +8,7 @@ mod contracts;
 mod diagnostics;
 mod domain;
 mod factors;
+mod fair_share;
 mod identity;
 mod lineage;
 mod observations;
@@ -20,6 +21,7 @@ mod return_time;
 mod runtime;
 mod scheduler;
 mod scheduler_admission;
+mod scheduler_fair_share;
 mod scheduler_fairness;
 mod scheduler_global;
 mod scheduler_lifecycle;
@@ -37,6 +39,7 @@ pub use domain::{
     ProgramUsageObservation,
 };
 pub use factors::{ContinuitySample, ProgressTtlFactors, RequestSample};
+pub use fair_share::{FairShareConfig, FairShareDiagnostic, FairShareFlowKey};
 pub use identity::{ProgramIdentity, ProgramRequestHints, ProgramSchedulingEnableKey};
 pub(crate) use observations::{max_prometheus_gauge, sum_prometheus_gauge};
 pub use observations::{

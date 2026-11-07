@@ -164,6 +164,8 @@ impl ProgramRuntime {
             old.expected_resume(),
             old.pending_output_prediction().cloned(),
         );
+        // A transport restart continues the same logical request and charge.
+        replacement.set_fair_share_charge(old.fair_share_charge());
         Some(replacement)
     }
 

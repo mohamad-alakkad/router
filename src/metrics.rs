@@ -116,6 +116,22 @@ pub fn init_metrics() {
         "vllm_router_agent_aware_queue_wait_seconds",
         "Time retained in the Program RequestPool before dispatch"
     );
+    describe_counter!(
+        "vllm_router_agent_aware_fair_share_charged_tokens_total",
+        "Fair-share token work charged at dispatch (estimate) and settled at completion (actual)"
+    );
+    describe_histogram!(
+        "vllm_router_agent_aware_fair_share_estimate_error_ratio",
+        "Settled fair-share charge divided by its dispatch estimate"
+    );
+    describe_histogram!(
+        "vllm_router_agent_aware_fair_share_resume_lag_tokens",
+        "Charged-service lead of a dispatched flow over the fair-share floor"
+    );
+    describe_gauge!(
+        "vllm_router_agent_aware_fair_share_tracked_flows",
+        "Fair-share flow accounts retained after pruning"
+    );
     describe_gauge!(
         "vllm_router_agent_aware_fitted_ttl_seconds",
         "Representative fitted acting TTL by target"
@@ -713,6 +729,44 @@ impl RouterMetrics {
             "reason" => reason
         )
         .increment(1);
+    }
+
+    pub fn record_agent_aware_fair_share_resume_lag(target: &str, lag_tokens: f64) {
+        histogram!(
+            "vllm_router_agent_aware_fair_share_resume_lag_tokens",
+            "target" => target.to_string()
+        )
+        .record(lag_tokens);
+    }
+
+    pub fn record_agent_aware_fair_share_settlement(
+        target: &str,
+        estimated_tokens: f64,
+        actual_tokens: f64,
+    ) {
+        counter!(
+            "vllm_router_agent_aware_fair_share_charged_tokens_total",
+            "target" => target.to_string(),
+            "phase" => "estimate"
+        )
+        .increment(estimated_tokens.round() as u64);
+        counter!(
+            "vllm_router_agent_aware_fair_share_charged_tokens_total",
+            "target" => target.to_string(),
+            "phase" => "actual"
+        )
+        .increment(actual_tokens.round() as u64);
+        if estimated_tokens > 0.0 {
+            histogram!(
+                "vllm_router_agent_aware_fair_share_estimate_error_ratio",
+                "target" => target.to_string()
+            )
+            .record(actual_tokens / estimated_tokens);
+        }
+    }
+
+    pub fn set_agent_aware_fair_share_tracked_flows(flows: usize) {
+        gauge!("vllm_router_agent_aware_fair_share_tracked_flows").set(flows as f64);
     }
 
     pub fn record_agent_aware_queue_wait(target: &str, duration: Duration) {

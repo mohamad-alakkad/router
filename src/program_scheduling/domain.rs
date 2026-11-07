@@ -96,6 +96,7 @@ pub struct ProgramDispatch {
     request_hints: ProgramRequestHints,
     expected_resume: bool,
     pending_output_prediction: Option<PendingOutputPrediction>,
+    fair_share_charge: Option<u64>,
 }
 
 impl ProgramDispatch {
@@ -126,7 +127,17 @@ impl ProgramDispatch {
             request_hints,
             expected_resume: true,
             pending_output_prediction: None,
+            fair_share_charge: None,
         }
+    }
+
+    /// Provisional fair-share charge settled when this logical request completes.
+    pub(crate) fn fair_share_charge(&self) -> Option<u64> {
+        self.fair_share_charge
+    }
+
+    pub(crate) fn set_fair_share_charge(&mut self, charge: Option<u64>) {
+        self.fair_share_charge = charge;
     }
 
     pub(crate) fn attach_prediction_context(

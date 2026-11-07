@@ -3,6 +3,7 @@
 //! All values in this module are protected by the ProgramScheduler mutex.
 //! They are decision facts, not an additional Program lifecycle state machine.
 
+use super::fair_share::{FairShareConfig, FairShareLedger};
 use super::lineage::ProgramLineage;
 use super::output_length::PendingOutputPrediction;
 use super::prediction_profile::PredictionProfileStore;
@@ -75,6 +76,8 @@ pub struct ProgramSchedulerConfig {
     pub progress_ttl: ProgressTtlConfig,
     /// Optional offline-seeded shadow predictors.
     pub prediction_profile: PredictionProfileConfig,
+    /// Opt-in token-cost fair-share ordering of ordinary resume candidates.
+    pub fair_share: FairShareConfig,
 }
 
 impl Default for ProgramSchedulerConfig {
@@ -103,6 +106,7 @@ impl Default for ProgramSchedulerConfig {
             shared_prefix_freshness_kv_turnovers: 2.0,
             progress_ttl: ProgressTtlConfig::default(),
             prediction_profile: PredictionProfileConfig::default(),
+            fair_share: FairShareConfig::default(),
         }
     }
 }
@@ -188,6 +192,7 @@ impl ProgramSchedulerConfig {
                 decode: config.decode_throughput_model,
             },
             prediction_profile: config.prediction_profile.clone(),
+            fair_share: config.fair_share.clone(),
         }
     }
 }
@@ -266,6 +271,8 @@ pub(crate) struct ProgramDecisionState {
     pub(crate) latest_output_prediction: Option<PendingOutputPrediction>,
     pub(crate) last_return_actual_seconds: Option<f64>,
     pub(crate) last_output_actual_tokens: Option<usize>,
+    /// Fair-share flow; `None` when fair share is disabled.
+    pub(crate) fair_share_flow: Option<Arc<str>>,
 }
 
 impl ProgramDecisionState {
@@ -326,6 +333,7 @@ impl ProgramDecisionState {
             latest_output_prediction: None,
             last_return_actual_seconds: None,
             last_output_actual_tokens: None,
+            fair_share_flow: None,
         }
     }
 
@@ -435,6 +443,8 @@ pub(crate) struct ProgramSchedulerState {
     pub(crate) prefill_pressure: Option<PrefillPressure>,
     /// Per-P-target metrics samples, keyed by base URL.
     pub(crate) prefill_targets: HashMap<String, PrefillTargetObservation>,
+    /// Token-cost service ledger; allocated only when fair share is enabled.
+    pub(crate) fair_share: Option<FairShareLedger>,
 }
 
 /// P KV-cache usage as seen from the prefill engines.
@@ -483,6 +493,10 @@ impl ProgramSchedulerState {
             lineage: ProgramLineage::default(),
             prefill_pressure: None,
             prefill_targets: HashMap::new(),
+            fair_share: config
+                .fair_share
+                .enabled
+                .then(|| FairShareLedger::new(config.fair_share.clone())),
         }
     }
 }
