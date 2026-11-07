@@ -1,0 +1,198 @@
+{
+  "params": {
+    "router_bin": "/home/user/router/target/release/vllm-router",
+    "engines": 2,
+    "slots": 8,
+    "service_ms": 500,
+    "overload_rps": 24.0,
+    "overload_secs": 15.0,
+    "recovery_rps": 8.0,
+    "recovery_secs": 3.0,
+    "kill_at": null,
+    "slo_ttft_s": 1.0,
+    "caps": "none,8",
+    "port_base": 39600
+  },
+  "runs": {
+    "cap=none": {
+      "overload": {
+        "offered": 360,
+        "completed_200": 360,
+        "rejected_429": 0,
+        "other": 0,
+        "other_statuses": [],
+        "ttft_p50_s": 0.00123409800016816,
+        "ttft_p99_s": 0.003500949000226683,
+        "ttft_max_s": 0.02057963899915194,
+        "within_slo": 360,
+        "reject_latency_p99_s": null,
+        "retry_after_values": []
+      },
+      "recovery": {
+        "offered": 24,
+        "completed_200": 24,
+        "rejected_429": 0,
+        "other": 0,
+        "other_statuses": [],
+        "ttft_p50_s": 0.001318090000495431,
+        "ttft_p99_s": 0.0018636010008776793,
+        "ttft_max_s": 0.0018636010008776793,
+        "within_slo": 24,
+        "reject_latency_p99_s": null,
+        "retry_after_values": []
+      },
+      "engines": [
+        {
+          "peak_running": 7,
+          "peak_waiting": 1,
+          "served": 192
+        },
+        {
+          "peak_running": 7,
+          "peak_waiting": 1,
+          "served": 192
+        }
+      ],
+      "max_engine_waiting_over_time": [
+        [
+          0.0,
+          0
+        ],
+        [
+          1.5,
+          0
+        ],
+        [
+          3.0,
+          0
+        ],
+        [
+          4.5,
+          0
+        ],
+        [
+          6.0,
+          0
+        ],
+        [
+          7.5,
+          0
+        ],
+        [
+          9.0,
+          0
+        ],
+        [
+          10.5,
+          0
+        ],
+        [
+          12.0,
+          0
+        ],
+        [
+          13.5,
+          0
+        ],
+        [
+          14.96,
+          0
+        ],
+        [
+          16.46,
+          0
+        ]
+      ]
+    },
+    "cap=8": {
+      "overload": {
+        "offered": 360,
+        "completed_200": 360,
+        "rejected_429": 0,
+        "other": 0,
+        "other_statuses": [],
+        "ttft_p50_s": 0.0013510300004782039,
+        "ttft_p99_s": 0.005071218999546545,
+        "ttft_max_s": 0.012700579000011203,
+        "within_slo": 360,
+        "reject_latency_p99_s": null,
+        "retry_after_values": []
+      },
+      "recovery": {
+        "offered": 24,
+        "completed_200": 24,
+        "rejected_429": 0,
+        "other": 0,
+        "other_statuses": [],
+        "ttft_p50_s": 0.0014366289997269632,
+        "ttft_p99_s": 0.0028157130000181496,
+        "ttft_max_s": 0.0028157130000181496,
+        "within_slo": 24,
+        "reject_latency_p99_s": null,
+        "retry_after_values": []
+      },
+      "engines": [
+        {
+          "peak_running": 7,
+          "peak_waiting": 1,
+          "served": 192
+        },
+        {
+          "peak_running": 7,
+          "peak_waiting": 1,
+          "served": 192
+        }
+      ],
+      "max_engine_waiting_over_time": [
+        [
+          0.0,
+          0
+        ],
+        [
+          1.5,
+          0
+        ],
+        [
+          3.0,
+          0
+        ],
+        [
+          4.5,
+          0
+        ],
+        [
+          6.0,
+          0
+        ],
+        [
+          7.5,
+          0
+        ],
+        [
+          9.0,
+          0
+        ],
+        [
+          10.5,
+          0
+        ],
+        [
+          12.0,
+          0
+        ],
+        [
+          13.5,
+          0
+        ],
+        [
+          14.96,
+          0
+        ],
+        [
+          16.46,
+          0
+        ]
+      ]
+    }
+  }
+}
